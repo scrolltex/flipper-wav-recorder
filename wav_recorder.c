@@ -2,10 +2,18 @@
 #include <furi_hal.h>
 #include <gui/gui.h>
 #include <input/input.h>
+#include <storage/storage.h>
+#include <locale/locale.h>
 #include <wav_recorder_icons.h>
 #include "furi_hal_adc.h"
+#include "wav_recorder_timer.h"
 
 #define TAG "WavRecorder"
+
+#define APPS_DATA EXT_PATH("apps_data")
+#define WAVRECORDER_FOLDER APPS_DATA "/wav_recorder"
+
+#define BUFFER_COUNT (2048)
 
 typedef enum {
     EventTypeTick,
@@ -27,6 +35,26 @@ typedef struct {
     uint32_t sample_max;
     uint32_t sample_min;
 } RecorderApp;
+
+/// 36 + SubChunk2Size
+// You Don't know this until you write your data but at a minimum it is 36 for an empty file
+uint32_t chunkSize = 36;
+///: For PCM == 16, since audioFormat == uint16_t
+uint32_t subChunk1Size = 16;
+///: For PCM this is 1, other values indicate compression
+const uint16_t audioFormat = 1;
+///: Mono = 1, Stereo = 2, etc.
+const uint16_t numChannels = 1;
+///: Sample Rate of file
+const uint32_t sampleRate = 11025;
+///: SampleRate * NumChannels * BitsPerSample/8
+const uint32_t byteRate = sampleRate * 2;
+///: The number of byte for one frame NumChannels * BitsPerSample/8
+const uint16_t blockAlign = 2;
+///: 8 bits = 8, 16 bits = 16
+const uint16_t bitsPerSample = 16;
+///: == NumSamples * NumChannels * BitsPerSample/8  i.e. number of byte in the data.
+uint32_t subChunk2Size = 0; // You Don't know this until you write your data
 
 static void wav_recorder_draw(Canvas* canvas, void* context) {
     furi_assert(context);
@@ -56,6 +84,10 @@ static void wav_recorder_input(InputEvent* event, void* context) {
 static void wav_recorder_tick(void* context) {
     furi_assert(context);
     FuriMessageQueue* event_queue = context;
+
+    // For now system was overloaded and skips at least half of samples.
+    // TODO: Write to buffer directly and trigger event only for flushing it to storage.
+
     RecorderEvent app_event = {.type = EventTypeTick};
     furi_message_queue_put(event_queue, &app_event, 0);
 }
@@ -93,7 +125,7 @@ static RecorderApp* wav_recorder_alloc() {
 
     app->mutex = furi_mutex_alloc(FuriMutexTypeNormal);
 
-    app->event_queue = furi_message_queue_alloc(8, sizeof(RecorderEvent));
+    app->event_queue = furi_message_queue_alloc(32, sizeof(RecorderEvent));
 
     app->view_port = view_port_alloc();
     view_port_draw_callback_set(app->view_port, wav_recorder_draw, app);
@@ -116,20 +148,102 @@ static void wav_recorder_free(RecorderApp* app) {
     free(app);
 }
 
+static FuriString* wav_recorder_get_file_path() {
+    FuriHalRtcDateTime now;
+    furi_hal_rtc_get_datetime(&now);
+
+    FuriString* file_path = furi_string_alloc_set(WAVRECORDER_FOLDER);
+
+    FuriString* file_name = furi_string_alloc();
+    locale_format_date(file_name, &now, locale_get_date_format(), "_");
+    furi_string_cat_printf(file_path, "/%s%s", furi_string_get_cstr(file_name), ".wav");
+
+    furi_string_free(file_name);
+
+    return file_path;
+}
+
+void write_wav_header(File* file) {
+    furi_assert(file);
+
+    storage_file_seek(file, 0, true);
+    storage_file_write(file, "RIFF", 4);
+    storage_file_write(file, (void*)&chunkSize, 4);
+    storage_file_write(file, "WAVE", 4);
+    storage_file_write(file, "fmt ", 4);
+    storage_file_write(file, &subChunk1Size, sizeof(uint32_t)); // format chunk size (16 for PCM)
+    storage_file_write(file, &audioFormat, sizeof(uint16_t)); // audio format = 1
+    storage_file_write(file, &numChannels, sizeof(uint16_t));
+    storage_file_write(file, (void*)&sampleRate, sizeof(uint32_t));
+    storage_file_write(file, (void*)&byteRate, sizeof(uint32_t));
+    storage_file_write(file, (void*)&blockAlign, sizeof(uint16_t));
+    storage_file_write(file, (void*)&bitsPerSample, sizeof(uint16_t));
+    storage_file_write(file, "data", 4);
+    storage_file_write(file, (void*)&subChunk2Size, sizeof(uint32_t));
+}
+
+static int32_t
+    map(int32_t value, int32_t in_min, int32_t in_max, int32_t out_min, int32_t out_max) {
+    return ((((value - in_min) * (out_max - out_min)) / (in_max - in_min)) + out_min);
+}
+
+void write_samples_to_file(File* file, int16_t* samples, size_t samples_count) {
+    furi_assert(file);
+    furi_assert(samples);
+
+    if(samples_count == 0) {
+        return;
+    }
+
+    subChunk2Size += numChannels * bitsPerSample / 8 * samples_count;
+    chunkSize = 36 + subChunk2Size;
+
+    storage_file_seek(file, 4, true);
+    storage_file_write(file, (void*)&chunkSize, 4);
+
+    storage_file_seek(file, 40, true);
+    storage_file_write(file, (void*)&subChunk2Size, 4);
+
+    storage_file_seek(file, storage_file_size(file) - 1, true);
+    storage_file_write(file, samples, sizeof(int16_t) * samples_count);
+}
+
 int32_t wav_recorder_app(void* p) {
     UNUSED(p);
-    FURI_LOG_I(TAG, "Hello world");
-    FURI_LOG_I(TAG, "I'm wav_recorder!");
+
+    Storage* storage = furi_record_open(RECORD_STORAGE);
+    if(!storage_simply_mkdir(storage, APPS_DATA)) {
+        FURI_LOG_E(TAG, "Could not create folder %s", APPS_DATA);
+        furi_record_close(storage);
+        return 0;
+    }
+
+    if(!storage_simply_mkdir(storage, WAVRECORDER_FOLDER)) {
+        FURI_LOG_E(TAG, "Could not create folder %s", WAVRECORDER_FOLDER);
+        furi_record_close(storage);
+        return 0;
+    }
+
+    FuriString* file_path = wav_recorder_get_file_path();
+
+    File* file = storage_file_alloc(storage);
+    bool res =
+        storage_file_open(file, furi_string_get_cstr(file_path), FSAM_WRITE, FSOM_CREATE_ALWAYS);
+    // TODO: check is file is successfully open
+
+    furi_check(res);
+
+    write_wav_header(file);
 
     wav_recorder_adc_init();
+    wav_recorder_sampling_init(sampleRate);
 
     RecorderApp* app = wav_recorder_alloc();
 
-    FuriTimer* timer =
-        furi_timer_alloc(wav_recorder_tick, FuriTimerTypePeriodic, app->event_queue);
+    int16_t* buffer = malloc(sizeof(int16_t) * BUFFER_COUNT);
+    size_t buffer_idx = 0;
 
-    // TODO: FuriTimer max frequency is 1kHz. Use hardware timer.
-    furi_timer_start(timer, 1);
+    wav_recorder_sampling_start(wav_recorder_tick, app->event_queue);
 
     RecorderEvent event;
     for(bool running = true; running;) {
@@ -143,20 +257,45 @@ int32_t wav_recorder_app(void* p) {
             furi_mutex_acquire(app->mutex, FuriWaitForever);
 
             uint32_t adc_value = furi_hal_adc_read_sw();
-            // float adc_voltage = 2.5f * (float)adc_value / 4096.0f;
+
+            uint32_t prev_max = app->sample_max;
+            uint32_t prev_min = app->sample_min;
+
             app->sample_max = MAX(adc_value, app->sample_max);
             app->sample_min = MIN(adc_value, app->sample_min);
 
+            buffer[buffer_idx++] = (int16_t)map(adc_value, 0, 4095, -32767, 32767);
+            if(buffer_idx == BUFFER_COUNT) {
+                write_samples_to_file(file, buffer, buffer_idx);
+                memset(buffer, 0, sizeof(int16_t) * BUFFER_COUNT);
+                buffer_idx = 0;
+            }
+
             furi_mutex_release(app->mutex);
-            view_port_update(app->view_port);
+            if(prev_max != app->sample_max || prev_min != app->sample_min) {
+                view_port_update(app->view_port);
+            }
         }
     }
 
-    furi_timer_stop(timer);
-    furi_timer_free(timer);
+    wav_recorder_sampling_stop();
+
+    if(buffer_idx > BUFFER_COUNT) {
+        write_samples_to_file(file, buffer, buffer_idx);
+        memset(buffer, 0, sizeof(int16_t) * BUFFER_COUNT);
+        buffer_idx = 0;
+    }
+
+    free(buffer);
+
+    storage_file_close(file);
+    storage_file_free(file);
+    furi_string_free(file_path);
+    furi_record_close(RECORD_STORAGE);
 
     wav_recorder_free(app);
 
+    wav_recorder_sampling_deinit();
     wav_recorder_adc_deinit();
 
     return 0;
